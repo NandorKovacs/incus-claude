@@ -1,0 +1,33 @@
+# packages.txt — pacman packages preinstalled in the container.
+#
+# One package per line. '#' starts a comment (whole-line or inline).
+# Edit this file and re-run incus-claude.sh to install added packages into an
+# existing container (it's re-applied idempotently on every launch).
+#
+# Note: tmux, git, curl and base-devel are always installed by the script itself
+# (the launch mechanism needs them), so you don't have to list them here.
+
+# --- core CLI / editors ---
+neovim
+ripgrep
+fd
+fzf
+bat
+eza
+jq
+tree
+htop
+man-db
+openssh
+rsync
+unzip
+wget
+
+# --- languages / runtimes (uncomment what you need) ---
+python
+python-pip
+nodejs
+npm
+#go
+#rust
+#uv          # also available via: --with uv
