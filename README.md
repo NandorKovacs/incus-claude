@@ -83,7 +83,6 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 | --- | --- |
 | `--rm` | Destroy the container (and any host `sshfs` mount) for the given path, then exit. |
 | `--name NAME` | Override the auto-derived container name. |
-| `--image IMAGE` | Base image (default: `images:archlinux`). |
 | `--mount-home` | Mount all of `$HOME` instead of just `~/.claude` + `~/.claude.json`. Most faithful, but exposes your whole home to the container. |
 | `--pkg "PKG..."` | Extra pacman packages on top of `packages.txt`. Repeatable; values accumulate. |
 | `--with NAME` | Install a curated tool by name. Repeatable. Recipes: `uv`, `bun`, `deno`, `rust`, `go`, `pnpm`. |

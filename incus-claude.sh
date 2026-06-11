@@ -11,7 +11,6 @@
 #   --rm                 Destroy the container (and any host sshfs mount) for the
 #                        given path, then exit.
 #   --name NAME          Override the auto-derived container name.
-#   --image IMAGE        Base image (default: images:archlinux).
 #   --mount-home         Mount all of $HOME instead of just ~/.claude + ~/.claude.json
 #                        (fully faithful, avoids the .claude.json staleness caveat,
 #                        but exposes your whole home to the container).
@@ -57,7 +56,9 @@ set -euo pipefail
 
 # ----- constants ------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-DEFAULT_IMAGE="images:archlinux"
+# Base image is fixed: all provisioning (packages.txt, --pkg, recipes) is pacman-only,
+# so only an Arch-based image works.
+IMAGE="images:archlinux"
 PACKAGES_FILE="${SCRIPT_DIR}/packages.txt"
 # Host identity: auto-detected from the invoking user, overridable via env.
 # These are bind-mounted into the container as a matching user so mounted files
@@ -79,7 +80,6 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; s/^#//' | sed '$d'
 # ----- arg parsing ----------------------------------------------------------
 TARGET=""
 CT_NAME=""
-IMAGE="$DEFAULT_IMAGE"
 DO_RM=0
 MOUNT_HOME=0
 ATTACH=1
@@ -94,7 +94,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --rm)         DO_RM=1; shift ;;
     --name)       CT_NAME="${2:?--name needs a value}"; shift 2 ;;
-    --image)      IMAGE="${2:?--image needs a value}"; shift 2 ;;
     --mount-home) MOUNT_HOME=1; shift ;;
     --pkg)        read -r -a _pkgs <<<"${2:?--pkg needs package name(s)}"
                   EXTRA_PKG+=("${_pkgs[@]}"); shift 2 ;;
