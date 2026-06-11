@@ -38,6 +38,15 @@
 #   an existing container — packages.txt and --pkg/--with/--run are re-applied
 #   idempotently on EVERY launch.
 #
+# Image cache (fast boot):
+#   The first launch provisions a throwaway builder (full pacman upgrade,
+#   packages.txt, the host-matching user, and Claude Code) and publishes it as a
+#   local Incus image named `incus-claude-<hash>`, where <hash> covers packages.txt,
+#   the always-installed essentials, and your host identity. Every later container
+#   is created straight from that image — no pacman or curl on boot. Change
+#   packages.txt and the hash changes, so the image is rebuilt once and stale ones
+#   are pruned. Images survive `--rm`; delete one by hand with `incus image delete`.
+#
 # Design notes:
 #   * Auth works by bind-mounting your host ~/.claude (and ~/.claude.json) into the
 #     container at the IDENTICAL path, under a container user whose uid/gid/name
@@ -60,6 +69,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # so only an Arch-based image works.
 IMAGE="images:archlinux"
 PACKAGES_FILE="${SCRIPT_DIR}/packages.txt"
+# Essentials the launch mechanism always needs (independent of packages.txt). Baked
+# into the cached image; kept in a constant so it can also feed the image cache key.
+ESSENTIALS="base-devel curl tmux git ca-certificates which less"
+# Bump when the provisioning logic below changes in a way that should invalidate
+# already-built cache images (it's mixed into the image hash).
+IMG_SCHEMA=1
 # Host identity: auto-detected from the invoking user, overridable via env.
 # These are bind-mounted into the container as a matching user so mounted files
 # (your ~/.claude, your workspace) keep their real ownership inside the box.
@@ -119,15 +134,17 @@ for r in "${WITH[@]}"; do
 done
 
 # ----- assemble package list (packages.txt + --pkg) -------------------------
-PKGS=()
+# FILE_PKGS  = packages.txt only — baked into the cached image and part of its hash.
+# PKGS       = FILE_PKGS + --pkg — the full set re-applied idempotently each launch.
+FILE_PKGS=()
 if [[ -f "$PACKAGES_FILE" ]]; then
   while IFS= read -r line; do
     line="${line%%#*}"            # strip inline comments
     read -r -a _toks <<<"$line"   # split + trim whitespace
-    [[ ${#_toks[@]} -gt 0 ]] && PKGS+=("${_toks[@]}")
+    [[ ${#_toks[@]} -gt 0 ]] && FILE_PKGS+=("${_toks[@]}")
   done < "$PACKAGES_FILE"
 fi
-PKGS+=("${EXTRA_PKG[@]}")
+PKGS=("${FILE_PKGS[@]}" "${EXTRA_PKG[@]}")
 
 [[ -n "$TARGET" ]] || { usage; die "missing <folder | user@host:/path> argument"; }
 
@@ -197,10 +214,95 @@ if [[ "$IS_SSH" -eq 1 ]]; then
   fi
 fi
 
+# ----- provisioning (shared by the image builder and the per-container path) -
+# Installs essentials + packages.txt, creates the host-matching user, installs
+# Claude Code, and drops the provisioned marker. Idempotent: safe to re-run.
+provision() { # $1 = container to provision
+  local ct="$1"
+  # wait for network/DNS before pacman+curl
+  for _ in $(seq 1 60); do
+    incus exec "$ct" -- getent hosts archlinux.org >/dev/null 2>&1 && break
+    sleep 1
+  done
+  incus exec "$ct" -- env \
+    H_UID="$HOST_UID" H_GID="$HOST_GID" H_USER="$HOST_USER" H_HOME="$HOST_HOME" \
+    MARKER="$PROVISION_MARKER" ESSENTIALS="$ESSENTIALS" BASE_PKGS="${FILE_PKGS[*]:-}" \
+    bash -s <<'PROVISION'
+set -euo pipefail
+
+# Sync + full upgrade (keeps the day-old image's keyring current) and install the
+# essentials the launch mechanism needs (tmux/curl/git/base-devel/…) plus the
+# packages.txt base set, so they're all baked into the published cache image.
+pacman -Syu --noconfirm --needed $ESSENTIALS ${BASE_PKGS:-}
+
+# user/group matching the host so mounted files are owned correctly
+getent group "$H_GID" >/dev/null 2>&1 || groupadd -g "$H_GID" "$H_USER"
+if ! getent passwd "$H_UID" >/dev/null 2>&1; then
+  useradd -o -u "$H_UID" -g "$H_GID" -d "$H_HOME" -s /bin/bash "$H_USER"
+fi
+# the home dir is auto-created by the bind mounts at runtime, but the image
+# builder has no mounts, so make sure it exists before we chown / install into it.
+mkdir -p "$H_HOME"
+# own the home dir itself (NOT recursive — mounts underneath keep their ownership)
+chown "$H_UID:$H_GID" "$H_HOME"
+
+# install Claude Code as the user, into ~/.local/bin
+runuser -u "$H_USER" -- env HOME="$H_HOME" USER="$H_USER" \
+  bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+
+# make `claude` resolvable regardless of PATH/login shell
+if [[ -x "$H_HOME/.local/bin/claude" ]]; then
+  ln -sf "$H_HOME/.local/bin/claude" /usr/local/bin/claude
+fi
+
+touch "$MARKER"
+PROVISION
+}
+
+# ----- cache image identity (build-and-cache, keyed on packages.txt) ---------
+# To avoid re-provisioning on every boot, we provision ONCE into a throwaway
+# builder container, publish it as a local image aliased by a hash of everything
+# baked in (essentials + packages.txt + host identity + schema), and create all
+# future containers straight from that image. While packages.txt is unchanged the
+# hash is stable, so the image is simply reused — no pacman/curl on boot.
+IMG_KEY="$( { printf '%s\n' "schema:$IMG_SCHEMA" \
+                            "essentials:$ESSENTIALS" \
+                            "identity:${HOST_UID}:${HOST_GID}:${HOST_USER}:${HOST_HOME}"; \
+             [[ -f "$PACKAGES_FILE" ]] && cat "$PACKAGES_FILE"; } \
+           | sha256sum | cut -c1-12 )"
+CACHE_IMAGE="incus-claude-${IMG_KEY}"
+
+# Build the cached image (idempotent: builds only if this hash isn't present).
+build_cache_image() {
+  incus image info "$CACHE_IMAGE" >/dev/null 2>&1 && return 0
+  local builder="incus-claude-build-${IMG_KEY}"
+  log "Building cached image $CACHE_IMAGE — one-time; reused while packages.txt is unchanged"
+  incus delete -f "$builder" >/dev/null 2>&1 || true   # clear any stale builder
+  incus launch "$IMAGE" "$builder"
+  for _ in $(seq 1 60); do incus exec "$builder" -- true >/dev/null 2>&1 && break; sleep 0.5; done
+  incus exec "$builder" -- true >/dev/null 2>&1 || die "image builder did not become ready"
+  provision "$builder"
+  incus stop "$builder"
+  log "Publishing image $CACHE_IMAGE"
+  incus publish "$builder" --alias "$CACHE_IMAGE" --reuse
+  incus delete -f "$builder"
+  # Drop superseded cache images left behind by older packages.txt versions.
+  for old in $(incus image list --format csv --columns l 2>/dev/null \
+               | tr ',' '\n' | sed 's/ (.*)//' \
+               | grep -E '^incus-claude-[0-9a-f]{12}$' || true); do
+    [[ "$old" == "$CACHE_IMAGE" ]] && continue
+    log "Removing superseded cache image $old"
+    incus image delete "$old" >/dev/null 2>&1 || true
+  done
+}
+
 # ----- create container (if missing) ----------------------------------------
+# Only build/fetch the cached image when we actually need to create a container;
+# reattaching to an existing one touches neither pacman nor the image cache.
 if ! incus info "$CT" >/dev/null 2>&1; then
-  log "Creating container $CT from $IMAGE"
-  incus create "$IMAGE" "$CT"
+  build_cache_image
+  log "Creating container $CT from $CACHE_IMAGE"
+  incus create "$CACHE_IMAGE" "$CT"
 fi
 # Defensive: a container from an older version of this script may carry a
 # raw.idmap that breaks startup on hosts without matching /etc/subuid entries.
@@ -273,45 +375,12 @@ for _ in $(seq 1 60); do incus exec "$CT" -- true >/dev/null 2>&1 && break; slee
 incus exec "$CT" -- true >/dev/null 2>&1 || die "container $CT did not become ready"
 
 # ----- provision (once) -----------------------------------------------------
+# Containers created from the cached image already carry the marker, so this is
+# normally a no-op. It still runs for containers whose marker isn't present —
+# e.g. --mount-home, where the host home mount shadows the image's baked marker.
 if ! incus exec "$CT" -- test -f "$PROVISION_MARKER" >/dev/null 2>&1; then
-  log "Provisioning $CT (user, base packages, Claude Code) — first run only"
-
-  # wait for network/DNS before pacman+curl
-  for _ in $(seq 1 60); do
-    incus exec "$CT" -- getent hosts archlinux.org >/dev/null 2>&1 && break
-    sleep 1
-  done
-
-  incus exec "$CT" -- env \
-    H_UID="$HOST_UID" H_GID="$HOST_GID" H_USER="$HOST_USER" H_HOME="$HOST_HOME" \
-    MARKER="$PROVISION_MARKER" bash -s <<'PROVISION'
-set -euo pipefail
-
-# Sync + full upgrade (keeps the day-old image's keyring current) and install the
-# essentials the launch mechanism needs regardless of packages.txt: tmux for the
-# session, curl for the Claude installer, git/base-devel for everyday dev work.
-pacman -Syu --noconfirm --needed \
-  base-devel curl tmux git ca-certificates which less
-
-# user/group matching the host so mounted files are owned correctly
-getent group "$H_GID" >/dev/null 2>&1 || groupadd -g "$H_GID" "$H_USER"
-if ! getent passwd "$H_UID" >/dev/null 2>&1; then
-  useradd -o -u "$H_UID" -g "$H_GID" -d "$H_HOME" -s /bin/bash "$H_USER"
-fi
-# own the home dir itself (NOT recursive — mounts underneath keep their ownership)
-chown "$H_UID:$H_GID" "$H_HOME"
-
-# install Claude Code as the user, into ~/.local/bin
-runuser -u "$H_USER" -- env HOME="$H_HOME" USER="$H_USER" \
-  bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-
-# make `claude` resolvable regardless of PATH/login shell
-if [[ -x "$H_HOME/.local/bin/claude" ]]; then
-  ln -sf "$H_HOME/.local/bin/claude" /usr/local/bin/claude
-fi
-
-touch "$MARKER"
-PROVISION
+  log "Provisioning $CT (user, base packages, Claude Code)"
+  provision "$CT"
 else
   log "Container already provisioned — reusing"
 fi

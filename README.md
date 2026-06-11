@@ -14,6 +14,7 @@ It works on **local folders** and on **remote folders over SSH** (mounted via `s
 - **Zero auth setup.** Your host `~/.claude` is bind-mounted in at the *same path* under a matching user, so the container is logged in the instant it starts. No token copying, no re-login.
 - **Persistent sessions.** Claude runs inside `tmux`. Detach with `Ctrl-b d`, close your terminal, come back later — re-run the script and you reattach to the same running session.
 - **Reproducible toolchain.** The package set lives in `packages.txt` and is re-applied idempotently on every launch, so containers are easy to reason about and rebuild.
+- **Fast boot.** The first launch bakes a fully-provisioned Incus image (system upgrade, `packages.txt`, the matching user, Claude Code) and caches it keyed on a hash of `packages.txt`. Every later container is created straight from that image — no `pacman` or installer on boot. Change `packages.txt` and it rebuilds once.
 
 ---
 
@@ -158,11 +159,11 @@ The base package set lives in [`packages.txt`](packages.txt) — one pacman pack
 The whole thing is a single Bash script. Here's the pipeline it runs on each launch:
 
 ```
-  ┌─────────────┐   ┌──────────────┐   ┌───────────────┐   ┌────────────┐   ┌──────────┐
-  │ parse args  │──▶│ classify     │──▶│ create / start│──▶│ provision  │──▶│ attach   │
-  │ + packages  │   │ target       │   │ container     │   │ (once) +   │   │ tmux ▶   │
-  │             │   │ local vs ssh │   │ + bind mounts │   │ packages   │   │ claude   │
-  └─────────────┘   └──────────────┘   └───────────────┘   └────────────┘   └──────────┘
+  ┌─────────────┐   ┌──────────────┐   ┌───────────────┐   ┌───────────────┐   ┌────────────┐   ┌──────────┐
+  │ parse args  │──▶│ classify     │──▶│ build/fetch   │──▶│ create / start│──▶│ provision  │──▶│ attach   │
+  │ + packages  │   │ target       │   │ cache image   │   │ container     │   │ (once) +   │   │ tmux ▶   │
+  │             │   │ local vs ssh │   │ (per pkgs.txt)│   │ + bind mounts │   │ packages   │   │ claude   │
+  └─────────────┘   └──────────────┘   └───────────────┘   └───────────────┘   └────────────┘   └──────────┘
 ```
 
 ### 1. Deterministic container naming
@@ -186,12 +187,23 @@ The target argument is classified by a regex: anything matching `something:/path
 - **Local:** bind-mounted directly with `shift=true`.
 - **Remote:** FUSE/`sshfs` mounts *cannot* be idmapped (`shift=true` fails on them). So the script reads the container's id-map base, mounts the remote with `sshfs` presenting every file as the **mapped host uid/gid** the container expects, then bind-mounts it with `shift=false`. The container's normal id map translates the ids straight back. `allow_other` lets the root Incus daemon read the FUSE mount; the host-side mount lives under `~/.cache/incus-claude/<hash>/mnt`.
 
-### 5. Provisioning
+### 5. Image cache (fast boot)
 
-- **First run only** (guarded by a marker file `~/.incus-claude-provisioned` in the container): full `pacman -Syu`, install the always-needed essentials, create the matching `nandor` user/group, then install Claude Code via the official `claude.ai/install.sh` into `~/.local/bin` and symlink it onto `PATH`.
-- **Every run:** apply `packages.txt` + `--pkg` (installing only missing packages), `--with` recipes (only if the tool is absent), and `--run` commands. All idempotent.
+Re-provisioning on every boot is slow, so provisioning happens **once, into an image**:
 
-### 6. The session
+- The script computes a hash over `packages.txt`, the always-installed essentials, and your host identity (uid/gid/user/home), giving a local image alias `incus-claude-<hash>`.
+- **If that image doesn't exist yet**, it provisions a throwaway *builder* container (full `pacman -Syu`, essentials, `packages.txt`, the matching user, Claude Code, marker), `incus publish`es it under the alias, deletes the builder, and prunes superseded `incus-claude-*` images from older `packages.txt` versions.
+- **If the image already exists** (packages.txt unchanged), it's reused as-is.
+- Every workspace container is then `incus create`d straight from that image, so a normal boot runs **no `pacman` and no installer** — it just starts and attaches.
+
+The image is only built/fetched when a container actually needs creating; reattaching to an existing container touches neither pacman nor the cache. Images survive `--rm` (they're the shared cache); remove one by hand with `incus image delete incus-claude-<hash>`.
+
+### 6. Provisioning
+
+- **First run only** (guarded by a marker file `~/.incus-claude-provisioned`): the steps above run inside the builder and are baked into the image. Containers created from the cached image already carry the marker, so the per-container provisioning step is a no-op. It still runs as a fallback when the marker isn't visible — e.g. `--mount-home`, where the host home mount shadows the image's baked marker.
+- **Every run:** apply `packages.txt` + `--pkg` (installing only missing packages — already-baked ones are fast no-ops), `--with` recipes (only if the tool is absent), and `--run` commands. All idempotent.
+
+### 7. The session
 
 Claude runs as `tmux new-session -A -s claude ... claude "${CLAUDE_ARGS[@]}"` — `-A` attaches if the `claude` session already exists, else creates it. That's what gives you a persistent session: detach with `Ctrl-b d`, and re-running the script reattaches with Claude still alive. Any startup args (from `--yolo` or a trailing `--`) are appended to `claude`; because `tmux -A` ignores the command when attaching to an existing session, those args only take effect on first creation. The script `exec`s `incus exec ... -t` as the matching user with a `PATH` that includes the dirs the curated recipes install into (`~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.deno/bin`).
 
@@ -210,6 +222,8 @@ The container shares your host `~/.claude` directory — including `__store.db`,
 ```
 
 This deletes the container and, for remote targets, unmounts the host `sshfs` mount and removes its cache directory. It's safe to run even if the container doesn't exist.
+
+The cached `incus-claude-<hash>` image is **not** removed by `--rm` — it's the shared fast-boot cache, reused by every container built from the same `packages.txt`. Superseded images are pruned automatically when a new one is built; to drop one by hand: `incus image delete incus-claude-<hash>` (or `incus image list` to see them).
 
 ---
 
