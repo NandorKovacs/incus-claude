@@ -209,9 +209,15 @@ Claude runs as `tmux new-session -A -s claude ... claude "${CLAUDE_ARGS[@]}"` �
 
 ---
 
-## ⚠️ Concurrency caveat
+## Concurrency
 
-The container shares your host `~/.claude` directory — including `__store.db`, `sessions/`, `history.jsonl`, and `.credentials.json`. **Use the container *instead of* host Claude, not at the same time.** Running both concurrently risks SQLite/state corruption. The script prints this warning on every launch.
+The container shares your host `~/.claude` directory — including `__store.db`, `sessions/`, `history.jsonl`, and `.credentials.json` — at the same path. That means several `claude` processes can be reading and writing the same state at once: multiple containers, the host, or a mix.
+
+**This is fine.** It's the same situation as running several host Claude instances side by side (different terminals, different projects) — a normal, everyday pattern that Claude Code is built to tolerate. Incus containers run on the **same host kernel** and a bind-mounted file is the *same inode*, so SQLite's POSIX file locking and WAL coordination apply across containers exactly as they do across host processes. The coordination domain is identical; there's no extra corruption risk from doing it through containers rather than directly on the host.
+
+So you can trust it to just work: launch as many container Claudes as you like, alongside host Claude if you want. There's a small residual risk inherent to any concurrent access of the shared store, but it's **comparable to running multiple Claude instances at once on a single machine** — nothing container-specific makes it worse.
+
+> Sessions and history are *shared* state, so concurrent instances see each other's session list and may interleave history. If you'd rather keep state fully separate per workspace, give each container its own `~/.claude` (mounting only `.credentials.json` for auth) — but that's an opt-in, not a requirement.
 
 ---
 

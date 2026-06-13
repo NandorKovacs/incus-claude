@@ -57,9 +57,14 @@
 #     edits.
 #   * Claude runs inside tmux (session 'claude'). Detach with Ctrl-b d; re-running
 #     this script reattaches to the same session with Claude still running.
-#   * CONCURRENCY: host Claude and container Claude share ~/.claude/__store.db,
-#     sessions/, history.jsonl and .credentials.json. Use the container INSTEAD OF
-#     host Claude, not at the same time, to avoid SQLite/state corruption.
+#   * CONCURRENCY: containers and host Claude share ~/.claude/__store.db,
+#     sessions/, history.jsonl and .credentials.json at the same path. Running
+#     several at once (multiple containers, the host, or a mix) is fine — it's the
+#     same risk class as running multiple host Claude instances side by side, which
+#     Claude Code tolerates. Containers run on the same host kernel and a bind mount
+#     is the same inode, so SQLite locking/WAL coordination applies across them just
+#     as it does across host processes. Sessions/history are shared state, so
+#     concurrent instances see and may interleave each other's.
 #
 set -euo pipefail
 
@@ -431,8 +436,8 @@ done <<<"$RUN_CMDS"
 EXTRAS
 fi
 
-# ----- concurrency caveat ---------------------------------------------------
-warn "Container shares ~/.claude with the host. Avoid running host Claude at the same time."
+# ----- concurrency note -----------------------------------------------------
+log "Container shares ~/.claude with the host. Running it alongside host/other-container Claude is fine — same risk class as multiple host instances."
 
 # ----- attach or print ------------------------------------------------------
 # PATH includes the dirs the curated recipes install into so uv/cargo/bun/etc.
