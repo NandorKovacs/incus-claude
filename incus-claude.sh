@@ -10,6 +10,10 @@
 # Options:
 #   --rm                 Destroy the container (and any host sshfs mount) for the
 #                        given path, then exit.
+#   --list, --ls         List the claude containers that currently exist (name,
+#                        status, and the workspace each was launched against), then
+#                        exit. Takes no folder argument. Use it to find which
+#                        container to --rm.
 #   --name NAME          Override the auto-derived container name.
 #   -w, --worktree NAME  Run against a git worktree of the target repo instead of
 #                        the repo itself. Mirrors Claude's native layout: a
@@ -114,6 +118,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; s/^#//' | sed '$d'
 TARGET=""
 CT_NAME=""
 DO_RM=0
+DO_LIST=0
 WORKTREE=""     # -w NAME: run against a git worktree (sibling dir) of the repo
 MOUNT_HOME=0
 ATTACH=1
@@ -127,6 +132,7 @@ KNOWN_RECIPES="uv bun deno rust go pnpm"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rm)         DO_RM=1; shift ;;
+    --list|--ls)  DO_LIST=1; shift ;;
     --name)       CT_NAME="${2:?--name needs a value}"; shift 2 ;;
     -w|--worktree) WORKTREE="${2:?-w/--worktree needs a name}"; shift 2 ;;
     --mount-home) MOUNT_HOME=1; shift ;;
@@ -152,6 +158,34 @@ for r in "${WITH[@]}"; do
     *) die "unknown --with recipe: '$r'. Known: $KNOWN_RECIPES (or use --pkg / --run)" ;;
   esac
 done
+
+# ----- list path ------------------------------------------------------------
+# Enumerate the claude containers that currently exist. Names are SHA-derived, so
+# we read back the workspace each was launched against from the metadata stamped
+# on it at creation time (user.incus-claude.target). Takes no target argument.
+if [[ "$DO_LIST" -eq 1 ]]; then
+  command -v incus >/dev/null 2>&1 || die "incus is not installed or not on PATH"
+  incus info >/dev/null 2>&1 \
+    || die "incus daemon not reachable. Set up and start incus first, then retry."
+  found=0
+  while IFS=, read -r name status; do
+    [[ -z "$name" ]] && continue
+    target="$(incus config get "$name" user.incus-claude.target 2>/dev/null || true)"
+    # Show our containers only: those carrying our metadata, or (for ones made by
+    # an older version of this script) those matching the claude-<hash> name.
+    [[ -z "$target" && ! "$name" =~ ^claude-[0-9a-f]{8}$ ]] && continue
+    if [[ "$found" -eq 0 ]]; then
+      printf '%-22s  %-9s  %s\n' "CONTAINER" "STATUS" "WORKSPACE"
+      found=1
+    fi
+    wt="$(incus config get "$name" user.incus-claude.worktree 2>/dev/null || true)"
+    label="${target:-(unknown — created by an older version)}"
+    [[ -n "$wt" ]] && label="$label  [worktree: $wt]"
+    printf '%-22s  %-9s  %s\n' "$name" "$status" "$label"
+  done < <(incus list --format csv -c n,s 2>/dev/null)
+  [[ "$found" -eq 1 ]] || log "No claude containers found."
+  exit 0
+fi
 
 # ----- assemble package list (packages.txt + --pkg) -------------------------
 # FILE_PKGS  = packages.txt only — baked into the cached image and part of its hash.
@@ -366,6 +400,10 @@ if ! incus info "$CT" >/dev/null 2>&1; then
   build_cache_image
   log "Creating container $CT from $CACHE_IMAGE"
   incus create "$CACHE_IMAGE" "$CT"
+  # Stamp the workspace this container maps to so --list can report it later
+  # (names are SHA-derived and can't be reversed to a path).
+  incus config set "$CT" user.incus-claude.target="$TARGET" || true
+  [[ -n "$WORKTREE" ]] && incus config set "$CT" user.incus-claude.worktree="$WORKTREE" || true
 fi
 # Defensive: a container from an older version of this script may carry a
 # raw.idmap that breaks startup on hosts without matching /etc/subuid entries.

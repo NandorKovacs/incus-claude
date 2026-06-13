@@ -84,6 +84,7 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 | Option | Effect |
 | --- | --- |
 | `--rm` | Destroy the container (and any host `sshfs` mount) for the given path, then exit. With `-w`, also removes the worktree. |
+| `--list`, `--ls` | List the claude containers that currently exist — name, status, and the workspace each was launched against — then exit. Takes no path argument; use it to find which container to `--rm`. |
 | `--name NAME` | Override the auto-derived container name. |
 | `-w`, `--worktree NAME` | Run against a git worktree of the target repo instead of the repo itself, so it gets its own container + session and runs in parallel with other worktrees (see [Parallel worktrees](#parallel-worktrees)). Local git repos only. |
 | `--mount-home` | Mount all of `$HOME` instead of just `~/.claude` + `~/.claude.json`. Most faithful, but exposes your whole home to the container. |
@@ -113,6 +114,10 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 
 # Tear down a remote workspace's container and unmount its sshfs
 ./incus-claude.sh --rm me@server:/srv/www/app
+
+# See which containers exist (and the workspace each maps to), then tear one down
+./incus-claude.sh --list
+./incus-claude.sh --rm ~/prg/myproject
 ```
 
 ---
@@ -252,6 +257,27 @@ The container shares your host `~/.claude` directory — including `__store.db`,
 So you can trust it to just work: launch as many container Claudes as you like, alongside host Claude if you want. There's a small residual risk inherent to any concurrent access of the shared store, but it's **comparable to running multiple Claude instances at once on a single machine** — nothing container-specific makes it worse.
 
 > Sessions and history are *shared* state, so concurrent instances see each other's session list and may interleave history. If you'd rather keep state fully separate per workspace, give each container its own `~/.claude` (mounting only `.credentials.json` for auth) — but that's an opt-in, not a requirement.
+
+---
+
+## Listing containers
+
+```bash
+./incus-claude.sh --list      # or --ls
+```
+
+Prints every claude container that currently exists, with its status and the workspace it was launched against:
+
+```
+CONTAINER               STATUS     WORKSPACE
+claude-1a2b3c4d         RUNNING    /home/you/prg/myproject
+claude-9f8e7d6c         STOPPED    you@server:/srv/www/app
+claude-44556677         RUNNING    /home/you/prg/myproject  [worktree: feature-a]
+```
+
+Because container names are a SHA of the target path (`claude-<hash>`) and can't be read back into a path, each container records its workspace as Incus metadata when it's first created, and `--list` reads that back. This is the easy way to find which container to [tear down](#teardown).
+
+> Containers created before this feature existed have no metadata; they still appear (matched by their `claude-<hash>` name) but show their workspace as `(unknown — created by an older version)`. Re-launching one against its original path restamps it.
 
 ---
 
