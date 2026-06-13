@@ -11,6 +11,14 @@
 #   --rm                 Destroy the container (and any host sshfs mount) for the
 #                        given path, then exit.
 #   --name NAME          Override the auto-derived container name.
+#   -w, --worktree NAME  Run against a git worktree of the target repo instead of
+#                        the repo itself. Mirrors Claude's native layout: a
+#                        worktree at <repo>/.claude/worktrees/<NAME> on branch
+#                        worktree-<NAME> (created if absent) becomes the workspace,
+#                        so it gets its OWN container + tmux session and runs fully
+#                        in parallel with other worktrees of the same repo. Local
+#                        git repos only. With --rm, also removes the worktree
+#                        (refuses if it has uncommitted changes).
 #   --mount-home         Mount all of $HOME instead of just ~/.claude + ~/.claude.json
 #                        (fully faithful, avoids the .claude.json staleness caveat,
 #                        but exposes your whole home to the container).
@@ -57,6 +65,11 @@
 #     edits.
 #   * Claude runs inside tmux (session 'claude'). Detach with Ctrl-b d; re-running
 #     this script reattaches to the same session with Claude still running.
+#   * WORKTREES (-w NAME): mirrors Claude's native worktree layout
+#     (<repo>/.claude/worktrees/<NAME>, branch worktree-<NAME>). Each -w session is
+#     a separate worktree → a separate container + tmux session, so multiple
+#     worktrees of one repo run in parallel. The whole repo is bind-mounted at its
+#     real path (cwd set to the worktree) so git works inside the container.
 #   * CONCURRENCY: containers and host Claude share ~/.claude/__store.db,
 #     sessions/, history.jsonl and .credentials.json at the same path. Running
 #     several at once (multiple containers, the host, or a mix) is fine — it's the
@@ -101,6 +114,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; s/^#//' | sed '$d'
 TARGET=""
 CT_NAME=""
 DO_RM=0
+WORKTREE=""     # -w NAME: run against a git worktree (sibling dir) of the repo
 MOUNT_HOME=0
 ATTACH=1
 EXTRA_PKG=()    # extra pacman packages (in addition to packages.txt)
@@ -114,6 +128,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --rm)         DO_RM=1; shift ;;
     --name)       CT_NAME="${2:?--name needs a value}"; shift 2 ;;
+    -w|--worktree) WORKTREE="${2:?-w/--worktree needs a name}"; shift 2 ;;
     --mount-home) MOUNT_HOME=1; shift ;;
     --pkg)        read -r -a _pkgs <<<"${2:?--pkg needs package name(s)}"
                   EXTRA_PKG+=("${_pkgs[@]}"); shift 2 ;;
@@ -174,8 +189,46 @@ else
   GUEST_PATH="$HOST_SOURCE"
 fi
 
+# ----- optional git worktree (-w) -------------------------------------------
+# Mirror Claude Code's native worktree layout: a worktree at
+# <repo>/.claude/worktrees/<NAME> on branch worktree-<NAME> becomes the session's
+# working dir (created with `git worktree add` if absent). We bind-mount the WHOLE
+# repo at its real path — so .git, project .claude settings and the worktree are
+# all present and git works inside the container — and set the container's cwd to
+# the worktree. The container name is keyed off the worktree path, so each -w
+# session gets its own container + tmux session and runs in parallel with other
+# worktrees of the same repo.
+REPO_TOP=""
+WT_PATH=""
+WORKDIR=""
+if [[ -n "$WORKTREE" ]]; then
+  [[ "$IS_SSH" -eq 1 ]] && die "-w/--worktree works only with a local git repo, not an ssh path"
+  git -C "$HOST_SOURCE" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "-w/--worktree requires the target to be inside a git repo: $HOST_SOURCE"
+  REPO_TOP="$(git -C "$HOST_SOURCE" rev-parse --show-toplevel)"
+  SAFE_WT="${WORKTREE//\//-}"                              # filesystem-safe name
+  WT_PATH="${REPO_TOP%/}/.claude/worktrees/${SAFE_WT}"     # native: <repo>/.claude/worktrees/<name>
+  WT_BRANCH="worktree-${WORKTREE}"                         # native branch name
+  if [[ "$DO_RM" -ne 1 && ! -d "$WT_PATH" ]]; then
+    log "Creating git worktree $WT_PATH (branch $WT_BRANCH)"
+    mkdir -p "${REPO_TOP%/}/.claude/worktrees"
+    if git -C "$REPO_TOP" show-ref --verify --quiet "refs/heads/$WT_BRANCH"; then
+      git -C "$REPO_TOP" worktree add "$WT_PATH" "$WT_BRANCH"        # attach existing branch
+    else
+      git -C "$REPO_TOP" worktree add -b "$WT_BRANCH" "$WT_PATH"     # create new branch
+    fi
+  fi
+  HOST_SOURCE="$REPO_TOP"    # mount the whole repo (covers .git + the worktree)
+  GUEST_PATH="$REPO_TOP"     # at its real host path
+  WORKDIR="$WT_PATH"         # but start Claude inside the worktree
+fi
+# cwd inside the container: the worktree for -w, else the mounted workspace root.
+: "${WORKDIR:=$GUEST_PATH}"
+
 # ----- derive deterministic container name ----------------------------------
-hash_input="${IS_SSH:+ssh:}${SSH_SPEC}${HOST_SOURCE}"
+# Worktree sessions append the worktree path so each gets its own container even
+# though they all mount the same repo root.
+hash_input="${IS_SSH:+ssh:}${SSH_SPEC}${HOST_SOURCE}${WORKTREE:+|wt:${WT_PATH}}"
 SHA8="$(printf '%s' "$hash_input" | sha256sum | cut -c1-8)"
 CT="${CT_NAME:-claude-${SHA8}}"
 SSHFS_MNT="${CACHE_DIR}/${SHA8}/mnt"
@@ -193,6 +246,11 @@ if [[ "$DO_RM" -eq 1 ]]; then
     fusermount3 -u "$SSHFS_MNT" || fusermount -u "$SSHFS_MNT" || true
   fi
   rm -rf "${CACHE_DIR:?}/${SHA8}" 2>/dev/null || true
+  if [[ -n "$WORKTREE" && -d "$WT_PATH" ]]; then
+    log "Removing git worktree $WT_PATH"
+    git -C "$REPO_TOP" worktree remove "$WT_PATH" 2>/dev/null \
+      || warn "Worktree $WT_PATH kept (uncommitted changes?). Remove manually: git -C '$REPO_TOP' worktree remove --force '$WT_PATH'"
+  fi
   exit 0
 fi
 
@@ -443,7 +501,7 @@ log "Container shares ~/.claude with the host. Running it alongside host/other-c
 # PATH includes the dirs the curated recipes install into so uv/cargo/bun/etc.
 # resolve in the session (incus exec is not a login shell).
 SESSION_PATH="${HOST_HOME}/.local/bin:${HOST_HOME}/.cargo/bin:${HOST_HOME}/.bun/bin:${HOST_HOME}/.deno/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENTER=(incus exec "$CT" --user "$HOST_UID" --group "$HOST_GID" --cwd "$GUEST_PATH"
+ENTER=(incus exec "$CT" --user "$HOST_UID" --group "$HOST_GID" --cwd "$WORKDIR"
        --env HOME="$HOST_HOME" --env "USER=$HOST_USER" --env "PATH=$SESSION_PATH"
        --env TERM="${TERM:-xterm}" -t)
 
@@ -452,10 +510,10 @@ ENTER=(incus exec "$CT" --user "$HOST_UID" --group "$HOST_GID" --cwd "$GUEST_PAT
 # else creates it; -c sets the working directory. Any CLAUDE_ARGS (from --yolo or a
 # trailing `--`) are appended to `claude` — they take effect only when the session
 # is first created; on reattach tmux ignores the command and Claude keeps running.
-TMUX_CMD=(tmux new-session -A -s claude -c "$GUEST_PATH" claude "${CLAUDE_ARGS[@]}")
+TMUX_CMD=(tmux new-session -A -s claude -c "$WORKDIR" claude "${CLAUDE_ARGS[@]}")
 
 if [[ "$ATTACH" -eq 1 ]]; then
-  log "Launching Claude Code in tmux in $CT (cwd: $GUEST_PATH; detach: Ctrl-b d)"
+  log "Launching Claude Code in tmux in $CT (cwd: $WORKDIR; detach: Ctrl-b d)"
   exec "${ENTER[@]}" -- "${TMUX_CMD[@]}"
 else
   log "Container ready. To attach to Claude in tmux:"

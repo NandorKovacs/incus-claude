@@ -13,6 +13,7 @@ It works on **local folders** and on **remote folders over SSH** (mounted via `s
 - **Isolation.** Claude runs as root-capable inside an unprivileged container. It can `pacman -S` whatever it wants, break its own environment, and you just `--rm` and start over. Your host stays clean.
 - **Zero auth setup.** Your host `~/.claude` is bind-mounted in at the *same path* under a matching user, so the container is logged in the instant it starts. No token copying, no re-login.
 - **Persistent sessions.** Claude runs inside `tmux`. Detach with `Ctrl-b d`, close your terminal, come back later — re-run the script and you reattach to the same running session.
+- **Parallel worktrees.** Pass `-w NAME` to run a session against a git worktree of your repo (Claude's native `<repo>/.claude/worktrees/<NAME>` layout). Each worktree gets its own container and session, so you can have several Claudes working different branches of one repo at once.
 - **Reproducible toolchain.** The package set lives in `packages.txt` and is re-applied idempotently on every launch, so containers are easy to reason about and rebuild.
 - **Fast boot.** The first launch bakes a fully-provisioned Incus image (system upgrade, `packages.txt`, the matching user, Claude Code) and caches it keyed on a hash of `packages.txt`. Every later container is created straight from that image — no `pacman` or installer on boot. Change `packages.txt` and it rebuilds once.
 
@@ -82,8 +83,9 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 
 | Option | Effect |
 | --- | --- |
-| `--rm` | Destroy the container (and any host `sshfs` mount) for the given path, then exit. |
+| `--rm` | Destroy the container (and any host `sshfs` mount) for the given path, then exit. With `-w`, also removes the worktree. |
 | `--name NAME` | Override the auto-derived container name. |
+| `-w`, `--worktree NAME` | Run against a git worktree of the target repo instead of the repo itself, so it gets its own container + session and runs in parallel with other worktrees (see [Parallel worktrees](#parallel-worktrees)). Local git repos only. |
 | `--mount-home` | Mount all of `$HOME` instead of just `~/.claude` + `~/.claude.json`. Most faithful, but exposes your whole home to the container. |
 | `--pkg "PKG..."` | Extra pacman packages on top of `packages.txt`. Repeatable; values accumulate. |
 | `--with NAME` | Install a curated tool by name. Repeatable. Recipes: `uv`, `bun`, `deno`, `rust`, `go`, `pnpm`. |
@@ -104,6 +106,10 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 
 # Provision without attaching (e.g. for scripting); prints the attach command
 ./incus-claude.sh --no-attach ~/prg/myproject
+
+# Two isolated worktree sessions of one repo, running in parallel
+./incus-claude.sh -w feature-a ~/prg/myproject   # in one terminal
+./incus-claude.sh -w feature-b ~/prg/myproject   # in another
 
 # Tear down a remote workspace's container and unmount its sshfs
 ./incus-claude.sh --rm me@server:/srv/www/app
@@ -146,6 +152,34 @@ There are two levels to choose from:
 
 ---
 
+## Parallel worktrees
+
+By default the same folder always maps to the **same** container and the **same** `tmux` session — re-running reattaches. That's exactly what you want for "come back to my session," but it means you can't get two independent Claude sessions on one repo that way.
+
+`-w NAME` (`--worktree NAME`) solves that by giving each session its own **git worktree**, mirroring how Claude Code creates worktrees natively: a worktree at `<repo>/.claude/worktrees/<NAME>` on a branch named `worktree-<NAME>`, created with `git worktree add` if it doesn't exist yet.
+
+```bash
+# Each runs in its own container + tmux session, fully in parallel
+./incus-claude.sh -w feature-a ~/prg/myproject
+./incus-claude.sh -w feature-b ~/prg/myproject
+```
+
+Because the container name is keyed off the worktree path, each `-w` session is a distinct container — so the two commands above don't collide, don't reattach to each other, and run side by side. Re-running the same `-w NAME` reattaches to that worktree's session as usual.
+
+How it's mounted: the **whole repo** is bind-mounted at its real path (so `.git`, project `.claude` settings, and the worktree are all present and git works normally inside the container), and Claude's working directory is set to the worktree. The worktree lives on the host, so its files and commits persist after the container is gone.
+
+Teardown removes the worktree too:
+
+```bash
+./incus-claude.sh --rm -w feature-a ~/prg/myproject
+```
+
+This deletes the container and runs `git worktree remove` on the worktree. The **branch is kept** (only the worktree checkout is removed). If the worktree has uncommitted changes, removal is refused and the script prints the exact `git worktree remove --force …` command so you can decide.
+
+> `-w` works with **local git repos only** (not `sshfs` remotes), and the target must be inside a git repo.
+
+---
+
 ## Managing packages
 
 The base package set lives in [`packages.txt`](packages.txt) — one pacman package per line, `#` comments allowed (whole-line or inline). To add packages to an **existing** container, just edit the file and re-run the script: `packages.txt`, `--pkg`, `--with`, and `--run` are all re-applied idempotently on every launch.
@@ -168,7 +202,7 @@ The whole thing is a single Bash script. Here's the pipeline it runs on each lau
 
 ### 1. Deterministic container naming
 
-The container name is derived from a SHA-256 of the resolved target path: `claude-<8 hex>`. The same folder always maps to the same container, which is what makes "re-run to reattach" work and what `--rm` keys off of. `--name` overrides it.
+The container name is derived from a SHA-256 of the resolved target path: `claude-<8 hex>`. The same folder always maps to the same container, which is what makes "re-run to reattach" work and what `--rm` keys off of. `--name` overrides it. With `-w NAME`, the worktree path is folded into the hash too, so each worktree of a repo gets its own distinct container (see [Parallel worktrees](#parallel-worktrees)).
 
 ### 2. Authentication by bind mount (the key trick)
 
@@ -227,7 +261,7 @@ So you can trust it to just work: launch as many container Claudes as you like, 
 ./incus-claude.sh --rm <same path you launched with>
 ```
 
-This deletes the container and, for remote targets, unmounts the host `sshfs` mount and removes its cache directory. It's safe to run even if the container doesn't exist.
+This deletes the container and, for remote targets, unmounts the host `sshfs` mount and removes its cache directory. It's safe to run even if the container doesn't exist. Add `-w NAME` to also remove that worktree (the branch is kept; refused if the worktree is dirty) — see [Parallel worktrees](#parallel-worktrees).
 
 The cached `incus-claude-<hash>` image is **not** removed by `--rm` — it's the shared fast-boot cache, reused by every container built from the same `packages.txt`. Superseded images are pruned automatically when a new one is built; to drop one by hand: `incus image delete incus-claude-<hash>` (or `incus image list` to see them).
 
