@@ -64,6 +64,8 @@
 #     container at the IDENTICAL path, under a container user whose uid/gid/name
 #     match the host (auto-detected; override with HOST_UID/HOST_GID/HOST_USER/
 #     HOST_HOME env vars). No tokens are copied or extracted.
+#   * Your global git config (~/.gitconfig and ~/.config/git) is bind-mounted too,
+#     so git identity, signing, aliases and credentials match the host.
 #   * Mounts use idmapped mounts (disk device shift=true) so host files appear with
 #     their real ids inside an UNPRIVILEGED container — no raw.idmap, no /etc/subuid
 #     edits.
@@ -401,8 +403,13 @@ if ! incus info "$CT" >/dev/null 2>&1; then
   log "Creating container $CT from $CACHE_IMAGE"
   incus create "$CACHE_IMAGE" "$CT"
   # Stamp the workspace this container maps to so --list can report it later
-  # (names are SHA-derived and can't be reversed to a path).
-  incus config set "$CT" user.incus-claude.target="$TARGET" || true
+  # (names are SHA-derived and can't be reversed to a path). For local folders
+  # record the RESOLVED absolute path (GUEST_PATH), not the raw argument — so a
+  # launch from `.` lists as /home/you/prg/foo, not ".". For ssh targets keep
+  # the full user@host:/path spec.
+  STAMP_TARGET="$TARGET"
+  [[ "$IS_SSH" -eq 0 ]] && STAMP_TARGET="$GUEST_PATH"
+  incus config set "$CT" user.incus-claude.target="$STAMP_TARGET" || true
   [[ -n "$WORKTREE" ]] && incus config set "$CT" user.incus-claude.worktree="$WORKTREE" || true
 fi
 # Defensive: a container from an older version of this script may carry a
@@ -456,6 +463,14 @@ else
   add_disk claudedir  "${HOST_HOME}/.claude"      "${HOST_HOME}/.claude"
   if [[ -f "${HOST_HOME}/.claude.json" ]]; then
     add_disk claudejson "${HOST_HOME}/.claude.json" "${HOST_HOME}/.claude.json"
+  fi
+  # Share the host's global git config so commits, user.name/email, signing,
+  # aliases, credentials etc. work inside the container the same as on the host.
+  if [[ -f "${HOST_HOME}/.gitconfig" ]]; then
+    add_disk gitconfig "${HOST_HOME}/.gitconfig" "${HOST_HOME}/.gitconfig"
+  fi
+  if [[ -d "${HOST_HOME}/.config/git" ]]; then
+    add_disk gitconfigdir "${HOST_HOME}/.config/git" "${HOST_HOME}/.config/git"
   fi
 fi
 if [[ "$IS_SSH" -eq 1 ]]; then

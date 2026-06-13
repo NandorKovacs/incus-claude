@@ -11,7 +11,7 @@ It works on **local folders** and on **remote folders over SSH** (mounted via `s
 ## Why
 
 - **Isolation.** Claude runs as root-capable inside an unprivileged container. It can `pacman -S` whatever it wants, break its own environment, and you just `--rm` and start over. Your host stays clean.
-- **Zero auth setup.** Your host `~/.claude` is bind-mounted in at the *same path* under a matching user, so the container is logged in the instant it starts. No token copying, no re-login.
+- **Zero auth setup.** Your host `~/.claude` is bind-mounted in at the *same path* under a matching user, so the container is logged in the instant it starts. No token copying, no re-login. Your global git config (`~/.gitconfig`, `~/.config/git`) is mounted in too, so commits carry your real identity and signing.
 - **Persistent sessions.** Claude runs inside `tmux`. Detach with `Ctrl-b d`, close your terminal, come back later — re-run the script and you reattach to the same running session.
 - **Parallel worktrees.** Pass `-w NAME` to run a session against a git worktree of your repo (Claude's native `<repo>/.claude/worktrees/<NAME>` layout). Each worktree gets its own container and session, so you can have several Claudes working different branches of one repo at once.
 - **Reproducible toolchain.** The package set lives in `packages.txt` and is re-applied idempotently on every launch, so containers are easy to reason about and rebuild.
@@ -212,6 +212,8 @@ The container name is derived from a SHA-256 of the resolved target path: `claud
 ### 2. Authentication by bind mount (the key trick)
 
 Rather than copying credentials, the script bind-mounts your host `~/.claude` (and `~/.claude.json`) into the container at the **identical path**, owned by a container user whose **uid/gid/name match the host** (auto-detected from the invoking user). Claude Code inside the container reads the exact same auth state your host Claude does — so it's logged in immediately, with no tokens extracted or duplicated.
+
+Your **global git config** is bind-mounted the same way: `~/.gitconfig` and `~/.config/git` (when present) are mounted in at their identical paths, so your git identity, signing keys, aliases, and credentials are all in effect inside the container. Commits Claude makes carry your real `user.name`/`user.email` and are signed exactly as they would be on the host — nothing to configure in the box.
 
 `--mount-home` instead mounts your entire `$HOME`. That's fully faithful (and sidesteps a `.claude.json` staleness caveat) but exposes everything in your home directory to the container.
 
