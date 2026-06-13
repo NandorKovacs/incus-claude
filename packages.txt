@@ -30,4 +30,4 @@ nodejs
 npm
 #go
 #rust
-#uv          # also available via: --with uv
+uv          # also available via: --with uv

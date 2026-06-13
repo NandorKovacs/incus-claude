@@ -28,6 +28,10 @@
 #                        but exposes your whole home to the container).
 #   --pkg "PKG..."       Extra pacman packages, in addition to packages.txt.
 #                        Repeatable; values accumulate.
+#   --packages FILE      Read the base package set from FILE instead of the
+#                        packages.txt next to this script. Only the file CONTENTS
+#                        feed the image hash, so two files with identical contents
+#                        at different paths reuse the same cached image.
 #   --with NAME          Install a curated tool by name. Repeatable. Known recipes:
 #                          uv, bun, deno, rust, go, pnpm
 #   --run 'CMD'          Arbitrary provisioning command, run as the container user.
@@ -140,6 +144,7 @@ while [[ $# -gt 0 ]]; do
     --mount-home) MOUNT_HOME=1; shift ;;
     --pkg)        read -r -a _pkgs <<<"${2:?--pkg needs package name(s)}"
                   EXTRA_PKG+=("${_pkgs[@]}"); shift 2 ;;
+    --packages)   PACKAGES_FILE="${2:?--packages needs a file path}"; shift 2 ;;
     --with)       WITH+=("${2:?--with needs a recipe name}"); shift 2 ;;
     --run)        RUN+=("${2:?--run needs a command}"); shift 2 ;;
     --yolo)       CLAUDE_ARGS+=(--dangerously-skip-permissions); shift ;;

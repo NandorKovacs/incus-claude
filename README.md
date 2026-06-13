@@ -89,6 +89,7 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 | `-w`, `--worktree NAME` | Run against a git worktree of the target repo instead of the repo itself, so it gets its own container + session and runs in parallel with other worktrees (see [Parallel worktrees](#parallel-worktrees)). Local git repos only. |
 | `--mount-home` | Mount all of `$HOME` instead of just `~/.claude` + `~/.claude.json`. Most faithful, but exposes your whole home to the container. |
 | `--pkg "PKG..."` | Extra pacman packages on top of `packages.txt`. Repeatable; values accumulate. |
+| `--packages FILE` | Read the base package set from `FILE` instead of the `packages.txt` next to the script. Only the file **contents** feed the image hash, so the same contents at a different path reuse the same cached image. |
 | `--with NAME` | Install a curated tool by name. Repeatable. Recipes: `uv`, `bun`, `deno`, `rust`, `go`, `pnpm`. |
 | `--run 'CMD'` | Arbitrary provisioning command, run as the container user after packages/recipes. Repeatable. Escape hatch for anything the above don't cover. |
 | `--yolo` | Start Claude with `--dangerously-skip-permissions` — it auto-accepts **every** tool use and edit, no prompts. Shorthand for `-- --dangerously-skip-permissions`. |
@@ -190,6 +191,8 @@ This deletes the container and runs `git worktree remove` on the worktree. The *
 The base package set lives in [`packages.txt`](packages.txt) — one pacman package per line, `#` comments allowed (whole-line or inline). To add packages to an **existing** container, just edit the file and re-run the script: `packages.txt`, `--pkg`, `--with`, and `--run` are all re-applied idempotently on every launch.
 
 `tmux`, `git`, `curl`, and `base-devel` are always installed by the script itself (the launch mechanism needs them), so you don't list them in `packages.txt`.
+
+To use a package file from elsewhere, pass `--packages FILE`. The image hash is computed over the file's **contents**, not its path, so the same contents at a different location reuse the same cached image.
 
 ---
 
