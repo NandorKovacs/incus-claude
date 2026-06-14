@@ -682,12 +682,35 @@ ENTER=(incus exec "$CT" --user "$HOST_UID" --group "$HOST_GID" --cwd "$WORKDIR"
        --env HOME="$HOST_HOME" --env "USER=$HOST_USER" --env "PATH=$SESSION_PATH"
        --env TERM="${TERM:-xterm}" -t)
 
+# Reproduce the exact WORKSPACE string that --ls prints for this container, so the
+# tmux title matches what `incus-claude --ls` shows (see the listing block above):
+# the resolved local path (GUEST_PATH) or the raw ssh spec, plus the worktree tag.
+WS_LABEL="$TARGET"
+[[ "$IS_SSH" -eq 0 ]] && WS_LABEL="$GUEST_PATH"
+[[ -n "$WORKTREE" ]] && WS_LABEL="$WS_LABEL  [worktree: $WORKTREE]"
+# The title carries both the workdir Claude starts in and the workspace label. For
+# a plain repo the two coincide (workdir == workspace), so show the label alone;
+# for a worktree the workdir (the worktree path) differs from the workspace (the
+# repo root), so show both.
+if [[ -n "$WORKTREE" ]]; then
+  TMUX_TITLE="$WORKDIR  ($WS_LABEL)"
+else
+  TMUX_TITLE="$WS_LABEL"
+fi
+
 # Run Claude inside a persistent tmux session named 'claude'. -A attaches to the
 # session if it already exists (so re-running reattaches with Claude still alive),
 # else creates it; -c sets the working directory. Any CLAUDE_ARGS (from --yolo or a
 # trailing `--`) are appended to `claude` — they take effect only when the session
 # is first created; on reattach tmux ignores the command and Claude keeps running.
-TMUX_CMD=(tmux new-session -A -s claude -c "$WORKDIR" claude "${CLAUDE_ARGS[@]}")
+# The chained set-option commands (run on create AND reattach) name the window and
+# the terminal title after TMUX_TITLE; automatic-/allow-rename are turned off so
+# neither tmux nor Claude overwrites that name.
+TMUX_CMD=(tmux new-session -A -s claude -n "$TMUX_TITLE" -c "$WORKDIR" claude "${CLAUDE_ARGS[@]}"
+          ";" set-option -wg automatic-rename off
+          ";" set-option -wg allow-rename off
+          ";" set-option -g set-titles on
+          ";" set-option -g set-titles-string "$TMUX_TITLE")
 
 if [[ "$ATTACH" -eq 1 ]]; then
   log "Launching Claude Code in tmux in $CT (cwd: $WORKDIR; detach: Ctrl-b d)"
