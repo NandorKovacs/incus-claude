@@ -23,9 +23,23 @@
 #                        in parallel with other worktrees of the same repo. Local
 #                        git repos only. With --rm, also removes the worktree
 #                        (refuses if it has uncommitted changes).
+#   --all-worktrees      Fan out across EVERY active workspace of the target repo:
+#                        the main repo itself PLUS every linked worktree under
+#                        <repo>/.claude/worktrees/ (the same set `git worktree list`
+#                        reports). Launches a container for each — the main repo as a
+#                        plain launch, each worktree as if -w NAME were run. Implies
+#                        --no-attach (you can't attach to many at once): every
+#                        workspace's attach command is printed. With --rm, tears all
+#                        of them down instead. Local git repos only; mutually
+#                        exclusive with -w/--worktree.
 #   --mount-home         Mount all of $HOME instead of just ~/.claude + ~/.claude.json
 #                        (fully faithful, avoids the .claude.json staleness caveat,
 #                        but exposes your whole home to the container).
+#   --uv-cache           Bind-mount the host uv cache (~/.cache/uv, or
+#                        $XDG_CACHE_HOME/uv) into the container at the same path, so
+#                        uv reuses packages the host already downloaded instead of
+#                        re-fetching them. No-op with --mount-home (which already
+#                        carries the cache). Override the source with UV_CACHE_DIR.
 #   --pkg "PKG..."       Extra pacman packages, in addition to packages.txt.
 #                        Repeatable; values accumulate.
 #   --packages FILE      Read the base package set from FILE instead of the
@@ -110,6 +124,9 @@ HOST_UID="${HOST_UID:-$(id -u)}"
 HOST_GID="${HOST_GID:-$(id -g)}"
 HOST_USER="${HOST_USER:-$(id -un)}"
 HOST_HOME="${HOST_HOME:-$HOME}"
+# Host uv cache to optionally share with containers (--uv-cache). Honors
+# XDG_CACHE_HOME like uv itself does; override directly with UV_CACHE_DIR.
+UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOST_HOME/.cache}/uv}"
 CACHE_DIR="${HOME}/.cache/incus-claude"
 PROVISION_MARKER="${HOST_HOME}/.incus-claude-provisioned"
 
@@ -125,8 +142,10 @@ TARGET=""
 CT_NAME=""
 DO_RM=0
 DO_LIST=0
+DO_ALL_WT=0     # --all-worktrees: fan out across every existing worktree of the repo
 WORKTREE=""     # -w NAME: run against a git worktree (sibling dir) of the repo
 MOUNT_HOME=0
+UV_CACHE=0      # --uv-cache: bind-mount the host uv cache into the container
 ATTACH=1
 EXTRA_PKG=()    # extra pacman packages (in addition to packages.txt)
 WITH=()         # curated recipe names
@@ -141,7 +160,9 @@ while [[ $# -gt 0 ]]; do
     --list|--ls)  DO_LIST=1; shift ;;
     --name)       CT_NAME="${2:?--name needs a value}"; shift 2 ;;
     -w|--worktree) WORKTREE="${2:?-w/--worktree needs a name}"; shift 2 ;;
+    --all-worktrees) DO_ALL_WT=1; shift ;;
     --mount-home) MOUNT_HOME=1; shift ;;
+    --uv-cache)   UV_CACHE=1; shift ;;
     --pkg)        read -r -a _pkgs <<<"${2:?--pkg needs package name(s)}"
                   EXTRA_PKG+=("${_pkgs[@]}"); shift 2 ;;
     --packages)   PACKAGES_FILE="${2:?--packages needs a file path}"; shift 2 ;;
@@ -228,6 +249,96 @@ else
   [[ -d "$TARGET" ]] || die "local folder does not exist: $TARGET"
   HOST_SOURCE="$(cd "$TARGET" && pwd -P)"
   GUEST_PATH="$HOST_SOURCE"
+fi
+
+# ----- all-worktrees fan-out ------------------------------------------------
+# Launch (or, with --rm, tear down) a container for EVERY active workspace of the
+# target repo: the main repo itself PLUS every linked worktree living under
+# <repo>/.claude/worktrees/ (exactly the set created by past -w NAME runs) — the
+# same set `git worktree list` reports. We don't reimplement the
+# create/mount/provision flow here: we re-invoke this very script once per
+# workspace (plain for the main repo, with -w NAME for each worktree), so each
+# goes through the identical single-container path (and the cached image is built
+# at most once, by the first child). Containers can't all be attached at once, so
+# launch implies --no-attach: each child prints its own attach command.
+if [[ "$DO_ALL_WT" -eq 1 ]]; then
+  [[ -n "$WORKTREE" ]] && die "--all-worktrees and -w/--worktree are mutually exclusive"
+  [[ -n "$CT_NAME" ]]  && die "--name can't be combined with --all-worktrees (each worktree gets its own derived name)"
+  [[ "$IS_SSH" -eq 1 ]] && die "--all-worktrees works only with a local git repo, not an ssh path"
+  git -C "$HOST_SOURCE" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "--all-worktrees requires the target to be inside a git repo: $HOST_SOURCE"
+  AWT_REPO_TOP="$(git -C "$HOST_SOURCE" rev-parse --show-toplevel)"
+  AWT_ROOT="${AWT_REPO_TOP%/}/.claude/worktrees"
+
+  # Enumerate the worktrees under <repo>/.claude/worktrees, recovering each one's
+  # launch NAME from its branch (worktree-<NAME>) so the recursive -w call maps
+  # back to the SAME worktree path and branch. Fall back to the directory basename
+  # if a worktree's branch doesn't follow the convention (detached HEAD, renamed
+  # branch, …) — note such a name round-trips only when it has no '/'.
+  AWT_NAMES=()
+  awt_cur_path=""; awt_cur_branch=""
+  awt_flush() {
+    [[ -z "$awt_cur_path" ]] && return
+    case "${awt_cur_path%/}/" in
+      "$AWT_ROOT"/*/)
+        if [[ "$awt_cur_branch" == worktree-* ]]; then
+          AWT_NAMES+=("${awt_cur_branch#worktree-}")
+        else
+          AWT_NAMES+=("$(basename "$awt_cur_path")")
+        fi ;;
+    esac
+    awt_cur_path=""; awt_cur_branch=""
+  }
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)            awt_flush; awt_cur_path="${line#worktree }" ;;
+      "branch refs/heads/"*)   awt_cur_branch="${line#branch refs/heads/}" ;;
+      "")                      awt_flush ;;
+    esac
+  done < <(git -C "$AWT_REPO_TOP" worktree list --porcelain)
+  awt_flush
+
+  if [[ "$DO_RM" -eq 1 ]]; then
+    log "Tearing down the main repo + ${#AWT_NAMES[@]} worktree container(s) of $AWT_REPO_TOP"
+    log "── main repo: $AWT_REPO_TOP ──"
+    "$0" --rm "$AWT_REPO_TOP" || warn "teardown failed for main repo"
+    for name in "${AWT_NAMES[@]}"; do
+      log "── worktree: $name ──"
+      "$0" --rm -w "$name" "$AWT_REPO_TOP" || warn "teardown failed for worktree '$name'"
+    done
+    exit 0
+  fi
+
+  # Forward the options that shape each container (but not the action/identity
+  # flags, which don't apply per-workspace). --yolo is already folded into
+  # CLAUDE_ARGS, so forwarding the trailing -- args reproduces it.
+  FWD=()
+  [[ "$MOUNT_HOME" -eq 1 ]] && FWD+=(--mount-home)
+  [[ "$UV_CACHE" -eq 1 ]] && FWD+=(--uv-cache)
+  [[ "$PACKAGES_FILE" != "${SCRIPT_DIR}/packages.txt" ]] && FWD+=(--packages "$PACKAGES_FILE")
+  for p in "${EXTRA_PKG[@]}"; do FWD+=(--pkg "$p"); done
+  for w in "${WITH[@]}"; do FWD+=(--with "$w"); done
+  for r in "${RUN[@]}"; do FWD+=(--run "$r"); done
+
+  # Re-invoke for one workspace: "$@" is empty for the main repo, or -w NAME for a
+  # worktree. The repo top is always the path argument (so a subdir target still
+  # maps the main container to the repo root, matching how -w mounts it).
+  awt_launch() {
+    if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+      "$0" "${FWD[@]}" --no-attach "$@" "$AWT_REPO_TOP" -- "${CLAUDE_ARGS[@]}"
+    else
+      "$0" "${FWD[@]}" --no-attach "$@" "$AWT_REPO_TOP"
+    fi
+  }
+
+  log "Launching the main repo + ${#AWT_NAMES[@]} worktree container(s) of $AWT_REPO_TOP (no-attach; attach commands printed below)"
+  log "── main repo: $AWT_REPO_TOP ──"
+  awt_launch || warn "launch failed for main repo"
+  for name in "${AWT_NAMES[@]}"; do
+    log "── worktree: $name ──"
+    awt_launch -w "$name" || warn "launch failed for worktree '$name'"
+  done
+  exit 0
 fi
 
 # ----- optional git worktree (-w) -------------------------------------------
@@ -476,6 +587,14 @@ else
   fi
   if [[ -d "${HOST_HOME}/.config/git" ]]; then
     add_disk gitconfigdir "${HOST_HOME}/.config/git" "${HOST_HOME}/.config/git"
+  fi
+  # Optionally share the host uv cache so uv reuses already-downloaded packages
+  # instead of re-fetching them. (With --mount-home the whole home is mounted, so
+  # the cache is already present and this branch is skipped.) Create the source
+  # first so the mount is valid even before the host has ever run uv.
+  if [[ "$UV_CACHE" -eq 1 ]]; then
+    mkdir -p "$UV_CACHE_DIR"
+    add_disk uvcache "$UV_CACHE_DIR" "$UV_CACHE_DIR"
   fi
 fi
 if [[ "$IS_SSH" -eq 1 ]]; then

@@ -87,7 +87,9 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 | `--list`, `--ls` | List the claude containers that currently exist — name, status, and the workspace each was launched against — then exit. Takes no path argument; use it to find which container to `--rm`. |
 | `--name NAME` | Override the auto-derived container name. |
 | `-w`, `--worktree NAME` | Run against a git worktree of the target repo instead of the repo itself, so it gets its own container + session and runs in parallel with other worktrees (see [Parallel worktrees](#parallel-worktrees)). Local git repos only. |
+| `--all-worktrees` | Fan out across **every** active workspace of the target repo — the **main repo itself** plus every linked worktree under `<repo>/.claude/worktrees/`. Launches a container for each (the main repo as a plain launch, each worktree as if `-w NAME` were run). Implies `--no-attach` and prints every workspace's attach command. With `--rm`, tears them all down instead. Local git repos only; mutually exclusive with `-w`. |
 | `--mount-home` | Mount all of `$HOME` instead of just `~/.claude` + `~/.claude.json`. Most faithful, but exposes your whole home to the container. |
+| `--uv-cache` | Bind-mount the host uv cache (`~/.cache/uv`, or `$XDG_CACHE_HOME/uv`) into the container at the same path, so uv reuses packages the host already downloaded instead of re-fetching them. No-op with `--mount-home`. Override the source with `UV_CACHE_DIR`. |
 | `--pkg "PKG..."` | Extra pacman packages on top of `packages.txt`. Repeatable; values accumulate. |
 | `--packages FILE` | Read the base package set from `FILE` instead of the `packages.txt` next to the script. Only the file **contents** feed the image hash, so the same contents at a different path reuse the same cached image. |
 | `--with NAME` | Install a curated tool by name. Repeatable. Recipes: `uv`, `bun`, `deno`, `rust`, `go`, `pnpm`. |
@@ -103,8 +105,8 @@ The remote path is mounted on the host with `sshfs` (using your existing SSH key
 # Local project with extra packages and the Rust toolchain
 ./incus-claude.sh --pkg "postgresql redis" --with rust ~/prg/api
 
-# Add uv + a one-off setup command
-./incus-claude.sh --with uv --run 'uv sync' ~/prg/ml-thing
+# Add uv + a one-off setup command, reusing the host's uv download cache
+./incus-claude.sh --with uv --uv-cache --run 'uv sync' ~/prg/ml-thing
 
 # Provision without attaching (e.g. for scripting); prints the attach command
 ./incus-claude.sh --no-attach ~/prg/myproject
@@ -183,6 +185,27 @@ Teardown removes the worktree too:
 This deletes the container and runs `git worktree remove` on the worktree. The **branch is kept** (only the worktree checkout is removed). If the worktree has uncommitted changes, removal is refused and the script prints the exact `git worktree remove --force …` command so you can decide.
 
 > `-w` works with **local git repos only** (not `sshfs` remotes), and the target must be inside a git repo.
+
+### All worktrees at once
+
+To bring up (or tear down) **every** worktree of a repo in one shot, use `--all-worktrees`:
+
+```bash
+# Launch a container for the main repo + every worktree under .claude/worktrees/
+./incus-claude.sh --all-worktrees ~/prg/myproject
+
+# Tear them all down (main repo container + worktree containers + worktrees) in one shot
+./incus-claude.sh --rm --all-worktrees ~/prg/myproject
+```
+
+It covers the **main repo itself** plus every linked worktree under `<repo>/.claude/worktrees/` (the ones created by past `-w NAME` runs) — the same set `git worktree list` reports. It re-invokes the script once per workspace (a plain launch for the main repo, `-w NAME` for each worktree), so each goes through the identical create/mount/provision path (the cached image is built at most once). Container-shaping options are forwarded to every workspace, so this works as you'd expect:
+
+```bash
+# Same toolchain + yolo mode across all worktrees of the repo
+./incus-claude.sh --all-worktrees --with rust --yolo ~/prg/myproject -- --model opus
+```
+
+Because you can't attach to many sessions at once, `--all-worktrees` implies `--no-attach`: it provisions each container and prints that worktree's attach command, so you can attach to whichever you want (or `incus exec … tmux attach -t claude`). It's local-repo-only and mutually exclusive with `-w`.
 
 ---
 
